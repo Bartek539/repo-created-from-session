@@ -1,0 +1,408 @@
+import gc
+import queue
+import shutil
+import threading
+import traceback
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import customtkinter as ctk
+import pandas as pd
+import pythoncom
+import win32com.client as win32
+from tkinter import filedialog, messagebox
+
+# ----------------------------------------------------------------------------
+# Konfiguracja
+# ----------------------------------------------------------------------------
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+# Stałe Excela
+XL_NONE = -4142
+XL_DOWN = -4121
+XL_TO_LEFT = -4159
+
+HEADER_ROW = 1                      # wiersz z nagłówkami w TA i Master
+DATE_FORMAT = "dd/mm/yyyy"          # format dat wpisywanych do Mastera
+COLOR_RED = 255                     # BGR: czerwony (Redeem date)
+COLOR_GREEN = 5287936               # BGR: zielony (Launch Date)
+COPY_SHEETS = ["NAV Summary", "Activ"]  # zakładki kopiowane z TA do Master
+
+CURRENCY_MAP = {"GBP": "Sterling", "EUR": "Euro", "USD": "US$"}          # podmiana części tekstu
+TRANSACTION_MAP = {"Export Part": "Redemption", "Switch Sub": "Subscription"}  # podmiana całej wartości
+
+TA_REQUIRED = ["ISIN", "Transaction Type", "Settlement Date", "Fund Name", "Unit Type Description"]
+MASTER_REQUIRED = ["ISIN", "Redeem date", "Launch Date", "Fund Name", "Share Class Name"]
+
+
+# ----------------------------------------------------------------------------
+# Funkcje pomocnicze (Excel / dane)
+# ----------------------------------------------------------------------------
+def norm(value: Any) -> str:
+    """Zamienia wartość komórki na oczyszczony tekst ('' dla pustych)."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def to_excel_date(value: Any) -> Any:
+    """Zwraca datetime (naiwny) lub None. Daty muszą trafić do Excela jako daty, nie jako tekst."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        ts = pd.Timestamp(value) if not isinstance(value, str) else pd.to_datetime(value, dayfirst=True)
+    except Exception:
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.to_pydatetime()
+
+
+def last_used_col(ws: Any) -> int:
+    return ws.Cells(HEADER_ROW, ws.Columns.Count).End(XL_TO_LEFT).Column
+
+
+def last_used_row(ws: Any) -> int:
+    used = ws.UsedRange
+    return used.Row + used.Rows.Count - 1
+
+
+def get_headers(ws: Any) -> Dict[str, int]:
+    """Mapa {nagłówek_casefold: nr kolumny} z wiersza nagłówków."""
+    last_col = last_used_col(ws)
+    values = ws.Range(ws.Cells(HEADER_ROW, 1), ws.Cells(HEADER_ROW, last_col)).Value
+    if not isinstance(values, tuple):          # pojedyncza komórka zwraca skalar
+        values = ((values,),)
+    headers: Dict[str, int] = {}
+    for idx, val in enumerate(values[0], start=1):
+        key = norm(val).casefold()
+        if key and key not in headers:
+            headers[key] = idx
+    return headers
+
+
+def find_data_sheet(wb: Any, required: List[str], exclude: Optional[List[str]] = None) -> Tuple[Any, Dict[str, int]]:
+    """Szuka zakładki zawierającej wszystkie wymagane nagłówki (zamiast ufać ActiveSheet)."""
+    exclude_cf = {e.casefold() for e in (exclude or [])}
+    for i in range(1, wb.Worksheets.Count + 1):
+        ws = wb.Worksheets(i)
+        if ws.Name.casefold() in exclude_cf:
+            continue
+        headers = get_headers(ws)
+        if all(r.casefold() in headers for r in required):
+            return ws, headers
+    raise ValueError(f"Nie znaleziono zakładki z kolumnami: {', '.join(required)}")
+
+
+def get_sheet(wb: Any, name: str) -> Optional[Any]:
+    for i in range(1, wb.Worksheets.Count + 1):
+        if wb.Worksheets(i).Name.casefold() == name.casefold():
+            return wb.Worksheets(i)
+    return None
+
+
+def read_column(ws: Any, col: int, last_row: int) -> List[Any]:
+    """Wartości kolumny od wiersza HEADER_ROW+1 do last_row (indeks 0 = HEADER_ROW+1)."""
+    first = HEADER_ROW + 1
+    if last_row < first:
+        return []
+    values = ws.Range(ws.Cells(first, col), ws.Cells(last_row, col)).Value
+    if not isinstance(values, tuple):
+        return [values]
+    return [r[0] for r in values]
+
+
+def read_table(ws: Any) -> pd.DataFrame:
+    """Wczytuje całą tabelę jednym wywołaniem COM; kolumny w casefold."""
+    last_col, last_row = last_used_col(ws), last_used_row(ws)
+    values = ws.Range(ws.Cells(HEADER_ROW, 1), ws.Cells(last_row, last_col)).Value
+    if not isinstance(values, tuple):
+        values = ((values,),)
+    rows = [list(r) for r in values]
+    columns = [norm(c).casefold() for c in rows[0]]
+    return pd.DataFrame(rows[1:], columns=columns)
+
+
+# ----------------------------------------------------------------------------
+# Logika biznesowa
+# ----------------------------------------------------------------------------
+def prepare_ta_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Podmiany walut i typów transakcji wykonywane w pandas (plik TA nie jest zapisywany)."""
+    unit_col = "unit type description"
+    trans_col = "transaction type"
+
+    def replace_currency(text: Any) -> str:
+        s = norm(text)
+        for old, new in CURRENCY_MAP.items():
+            s = s.replace(old, new)
+        return s
+
+    df[unit_col] = df[unit_col].map(replace_currency)
+    df[trans_col] = df[trans_col].map(lambda v: TRANSACTION_MAP.get(norm(v), norm(v)))
+    return df
+
+
+def process_files(ta_file: Path, master_file: Path, out_dir: Path, log) -> None:
+    pythoncom.CoInitialize()
+    excel = wb_ta = wb_master = None
+    try:
+        # DispatchEx = nowa, osobna instancja Excela (Quit() nie zamknie Excela użytkownika)
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.AskToUpdateLinks = False
+        excel.ScreenUpdating = False
+
+        # 1. Kopia Master (kopia pliku zachowuje format: xlsx/xlsm/xlsb/xls)
+        out_master_path = out_dir / f"Updated_{master_file.name}"
+        log(f"Tworzę kopię Master: {out_master_path}")
+        shutil.copy2(master_file, out_master_path)
+
+        wb_master = excel.Workbooks.Open(str(out_master_path), UpdateLinks=0)
+        wb_ta = excel.Workbooks.Open(str(ta_file), UpdateLinks=0, ReadOnly=True)
+
+        # 2. Znajdź arkusze z danymi (przed kopiowaniem zakładek!)
+        ws_ta, _ = find_data_sheet(wb_ta, TA_REQUIRED, exclude=COPY_SHEETS)
+        ws_m, mh = find_data_sheet(wb_master, MASTER_REQUIRED, exclude=COPY_SHEETS)
+        log(f"Arkusz danych TA: '{ws_ta.Name}', Master: '{ws_m.Name}'")
+
+        c_isin = mh["isin"]
+        c_redeem = mh["redeem date"]
+        c_launch = mh["launch date"]
+        c_fund = mh["fund name"]
+        c_share = mh["share class name"]
+        last_col_m = last_used_col(ws_m)
+
+        # 3. Dane TA -> pandas (bezpośrednio z COM, bez pliku tymczasowego)
+        df_ta = prepare_ta_dataframe(read_table(ws_ta))
+        log(f"Wczytano {len(df_ta)} wierszy z TA.")
+
+        # 4. Kopiowanie zakładek z TA do Master
+        for sheet_name in COPY_SHEETS:
+            ws_source = get_sheet(wb_ta, sheet_name)
+            if ws_source is None:
+                log(f"Ostrzeżenie: brak zakładki '{sheet_name}' w pliku TA.")
+                continue
+            ws_dest = get_sheet(wb_master, sheet_name)
+            if ws_dest is None:
+                ws_dest = wb_master.Worksheets.Add(After=wb_master.Worksheets(wb_master.Worksheets.Count))
+                ws_dest.Name = sheet_name
+            else:
+                ws_dest.Cells.Clear()
+            ws_source.Cells.Copy(ws_dest.Cells)
+            log(f"Skopiowano zakładkę '{sheet_name}'.")
+
+        # 5. Mapowanie wierszy
+        log("Rozpoczynam mapowanie wierszy (ISIN)...")
+        isin_rows: Optional[Dict[str, int]] = None   # budowane leniwie, odświeżane po każdym wstawieniu
+        updated = inserted = skipped = 0
+
+        for _, row in df_ta.iterrows():
+            isin = norm(row["isin"])
+            if not isin or isin.lower() == "nan":
+                continue
+            trans_type = norm(row["transaction type"])
+            settle_date = to_excel_date(row["settlement date"])
+            fund_name = norm(row["fund name"])
+            unit_desc = norm(row["unit type description"])
+
+            last_row = last_used_row(ws_m)
+            if isin_rows is None:
+                col_vals = read_column(ws_m, c_isin, last_row)
+                isin_rows = {norm(v).upper(): i + HEADER_ROW + 1 for i, v in enumerate(col_vals) if norm(v)}
+
+            found_row = isin_rows.get(isin.upper())
+
+            if found_row is not None:
+                # Przypadek 1: ISIN istnieje
+                if trans_type == "Redemption":
+                    if settle_date is None:
+                        log(f"Ostrzeżenie: brak Settlement Date dla {isin} - pominięto.")
+                        skipped += 1
+                        continue
+                    cell = ws_m.Cells(found_row, c_redeem)
+                    cell.Value = settle_date
+                    cell.NumberFormat = DATE_FORMAT
+                    cell.Interior.Color = COLOR_RED
+                    updated += 1
+                    log(f"Zaktualizowano datę Redeem dla {isin} (wiersz {found_row}).")
+                continue
+
+            # Przypadek 2: ISIN nie istnieje
+            if trans_type != "Subscription":
+                log(f"Ostrzeżenie: ISIN {isin} ({trans_type}) nie istnieje w Master - pominięto.")
+                skipped += 1
+                continue
+
+            fund_vals = read_column(ws_m, c_fund, last_row)
+            share_vals = read_column(ws_m, c_share, last_row)
+            block = [i for i, v in enumerate(fund_vals) if norm(v).casefold() == fund_name.casefold()]
+            if not block:
+                log(f"Ostrzeżenie: nie znaleziono funduszu '{fund_name}' dla ISIN {isin}.")
+                skipped += 1
+                continue
+
+            offset = HEADER_ROW + 1
+            block_start, block_end = block[0] + offset, block[-1] + offset
+
+            # Miejsce wstawienia - alfabetycznie wg Share Class Name w obrębie funduszu
+            insert_row = block_end + 1
+            for i in block:
+                if unit_desc.casefold() < norm(share_vals[i]).casefold():
+                    insert_row = i + offset
+                    break
+
+            # Wiersz wzorcowy do skopiowania formuł (po wstawieniu)
+            ref_row = insert_row + 1 if insert_row <= block_end else insert_row - 1
+
+            ws_m.Rows(insert_row).Insert(Shift=XL_DOWN)
+
+            # Kopiuj tylko FORMUŁY z wiersza wzorcowego (stare wartości/kolory nie są przenoszone)
+            for c in range(1, last_col_m + 1):
+                src = ws_m.Cells(ref_row, c)
+                if src.HasFormula:
+                    ws_m.Cells(insert_row, c).FormulaR1C1 = src.FormulaR1C1
+
+            ws_m.Cells(insert_row, c_redeem).Interior.ColorIndex = XL_NONE
+            ws_m.Cells(insert_row, c_isin).Value = isin
+            ws_m.Cells(insert_row, c_fund).Value = fund_name
+            ws_m.Cells(insert_row, c_share).Value = unit_desc
+
+            launch_cell = ws_m.Cells(insert_row, c_launch)
+            if settle_date is not None:
+                launch_cell.Value = settle_date
+                launch_cell.NumberFormat = DATE_FORMAT
+            launch_cell.Interior.Color = COLOR_GREEN
+
+            inserted += 1
+            isin_rows = None   # numery wierszy się przesunęły - przebuduj mapę
+            log(f"Dodano nową klasę jednostek {isin} w wierszu {insert_row}.")
+
+        excel.ScreenUpdating = True
+        wb_master.Save()
+        log(f"Zakończono. Zaktualizowano: {updated}, dodano: {inserted}, pominięto: {skipped}.")
+
+    finally:
+        for wb in (wb_master, wb_ta):
+            if wb is not None:
+                try:
+                    wb.Close(SaveChanges=False)
+                except Exception:
+                    pass
+        if excel is not None:
+            try:
+                excel.ScreenUpdating = True
+                excel.Quit()
+            except Exception:
+                pass
+        # zwolnij obiekty COM przed CoUninitialize
+        wb_master = wb_ta = excel = None
+        gc.collect()
+        pythoncom.CoUninitialize()
+
+
+# ----------------------------------------------------------------------------
+# GUI
+# ----------------------------------------------------------------------------
+class ExcelAutomatorApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("TA & Master Share Class Automator")
+        self.geometry("700x450")
+
+        self.ta_path = ctk.StringVar()
+        self.master_path = ctk.StringVar()
+        self.output_dir = ctk.StringVar()
+        self.log_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+
+        self.setup_ui()
+        self.after(100, self._poll_queue)
+
+    def setup_ui(self):
+        ctk.CTkLabel(self, text="Plik TA (źródło):").grid(row=0, column=0, padx=10, pady=(20, 5), sticky="w")
+        ctk.CTkEntry(self, textvariable=self.ta_path, width=400).grid(row=0, column=1, padx=10, pady=(20, 5))
+        ctk.CTkButton(self, text="Przeglądaj", command=lambda: self.select_file(self.ta_path)).grid(row=0, column=2, padx=10, pady=(20, 5))
+
+        ctk.CTkLabel(self, text="Plik Master Share Class:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkEntry(self, textvariable=self.master_path, width=400).grid(row=1, column=1, padx=10, pady=5)
+        ctk.CTkButton(self, text="Przeglądaj", command=lambda: self.select_file(self.master_path)).grid(row=1, column=2, padx=10, pady=5)
+
+        ctk.CTkLabel(self, text="Katalog docelowy:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkEntry(self, textvariable=self.output_dir, width=400).grid(row=2, column=1, padx=10, pady=5)
+        ctk.CTkButton(self, text="Przeglądaj", command=self.select_directory).grid(row=2, column=2, padx=10, pady=5)
+
+        self.run_btn = ctk.CTkButton(self, text="RUN", command=self.run_process, fg_color="green", hover_color="darkgreen")
+        self.run_btn.grid(row=3, column=1, pady=30, ipadx=20, ipady=10)
+
+        self.log_box = ctk.CTkTextbox(self, width=650, height=150)
+        self.log_box.grid(row=4, column=0, columnspan=3, padx=10, pady=10)
+
+    # --- logowanie bezpieczne wątkowo: wątek roboczy tylko wkłada do kolejki ---
+    def log(self, message: str):
+        self.log_queue.put(("log", message))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.log_queue.get_nowait()
+                if kind == "log":
+                    self.log_box.insert("end", payload + "\n")
+                    self.log_box.see("end")
+                elif kind == "done":
+                    self.run_btn.configure(state="normal")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def select_file(self, string_var: ctk.StringVar):
+        file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xlsm *.xlsb *.xls")])
+        if file_path:
+            string_var.set(file_path)
+
+    def select_directory(self):
+        dir_path = filedialog.askdirectory()
+        if dir_path:
+            self.output_dir.set(dir_path)
+
+    def run_process(self):
+        ta_str = self.ta_path.get().strip()
+        master_str = self.master_path.get().strip()
+        out_str = self.output_dir.get().strip()
+
+        # Path("") == "." i exists() zwraca True - dlatego najpierw sprawdzamy puste ciągi
+        if not (ta_str and master_str and out_str):
+            messagebox.showerror("Błąd", "Uzupełnij wszystkie ścieżki.")
+            return
+        ta_file, master_file, out_dir = Path(ta_str), Path(master_str), Path(out_str)
+        if not (ta_file.is_file() and master_file.is_file() and out_dir.is_dir()):
+            messagebox.showerror("Błąd", "Sprawdź poprawność wszystkich ścieżek.")
+            return
+
+        self.run_btn.configure(state="disabled")
+        self.log("Rozpoczynam proces...")
+        threading.Thread(target=self._worker, args=(ta_file, master_file, out_dir), daemon=True).start()
+
+    def _worker(self, ta_file: Path, master_file: Path, out_dir: Path):
+        try:
+            process_files(ta_file, master_file, out_dir, self.log)
+        except Exception as e:
+            self.log(f"WYSTĄPIŁ BŁĄD: {e}")
+            self.log(traceback.format_exc())
+        finally:
+            self.log_queue.put(("done", ""))
+
+
+if __name__ == "__main__":
+    app = ExcelAutomatorApp()
+    app.mainloop()
